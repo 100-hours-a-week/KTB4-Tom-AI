@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from datetime import datetime
+from sqlalchemy import ForeignKey, create_engine, event, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
+from contextlib import asynccontextmanager
 import httpx
 
-app = FastAPI()
 
 # ----- LLM 설정 -----
 OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
@@ -37,6 +39,8 @@ class PostRead(BaseModel):
     author: str
     created_at: datetime
 
+    model_config = {"from_attributes": True}
+
 # 댓글 스키마
 class CommentCreate(BaseModel):
     content: str
@@ -52,133 +56,198 @@ class CommentRead(BaseModel):
     author: str
     created_at: datetime
 
+    model_config = {"from_attributes": True}
+
 # LLM 스키마
 class SummaryResponse(BaseModel):
     target_type: str
     target_id: int
     summary: str
 
-# ----- 메모리 저장소 -----
-posts: dict[int, dict] = dict()
-comments: dict[int, dict] = dict()
-post_id_seq = 0
-comment_id_seq = 0
+# ----- DB 모델 정의 -----
+class Base(DeclarativeBase):
+    pass
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str]
+    content: Mapped[str]
+    author: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="post",
+        cascade="all, delete-orphan",
+        passive_deletes=True
+    )
+
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    post_id: Mapped[int] = mapped_column(
+        ForeignKey("posts.id", ondelete="CASCADE")
+    )
+    content: Mapped[str]
+    author: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+    post: Mapped["Post"] = relationship(back_populates="comments")
+
+# ----- DB 엔진, 세션, lifespan -----
+DATABASE_URL = "sqlite:///community.db"
+
+engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        echo=True
+)
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+def get_session() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(engine)
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # ----- Post 엔드포인트 -----
 # 게시글 생성
 @app.post("/posts", response_model=PostRead, status_code=201)
-def create_post(post: PostCreate):
-    global post_id_seq
-    post_id_seq += 1
-    new_post = {
-        "id": post_id_seq,
-        "title": post.title,
-        "content": post.content,
-        "author": post.author,
-        "created_at": datetime.now()
-    }
+def create_post(payload: PostCreate, db: Session = Depends(get_session)):
+    post = Post(
+        title = payload.title,
+        content = payload.content,
+        author = payload.author
+    )
 
-    posts[post_id_seq] = new_post
-    return new_post
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return post
 
 # 전체 게시글 조회
 @app.get("/posts", response_model=list[PostRead])
-def get_all_posts():
-    return list(posts.values())
+def get_all_posts(db: Session = Depends(get_session)):
+    return db.scalars(select(Post)).all()
 
 # 게시글 한 개 조회
 @app.get("/posts/{post_id}", response_model=PostRead)
-def get_one_post(post_id: int):
-    if post_id not in posts:
+def get_one_post(post_id: int, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    return posts[post_id]
+    return post
 
 # 게시글 수정 / 지금은 put으로 부분수정도 함께
 @app.put("/posts/{post_id}", response_model=PostRead)
-def update_post(post_id: int, updated_post: PostUpdate):
-    post = posts.get(post_id)
+def update_post(post_id: int, updated_post: PostUpdate, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
 
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    if updated_post.title is not None:
-        post["title"] = updated_post.title
-    if updated_post.content is not None:
-        post["content"] = updated_post.content
     
+    if updated_post.title is not None:
+        post.title = updated_post.title
+    if updated_post.content is not None:
+        post.content = updated_post.content
+    
+    db.commit()
+    db.refresh(post)
     return post
 
 # 게시글 삭제
 @app.delete("/posts/{post_id}", status_code=204)
-def delete_post(post_id: int):
-    post = posts.get(post_id)
+def delete_post(post_id: int, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
 
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    del posts[post_id]
-
-    # 게시글의 댓글도 삭제
-    to_delete = [cid for cid, c in comments.items() if c["post_id"] == post_id]
-
-    for cid in to_delete:
-        del comments[cid]
+    
+    db.delete(post)
+    db.commit()
 
 # ----- Comment 엔드포인트 -----
 # 댓글 생성
 @app.post("/posts/{post_id}/comments", response_model=CommentRead, status_code=201)
-def create_comment(post_id: int, comment: CommentCreate):
-    if post_id not in posts:
+def create_comment(post_id: int, payload: CommentCreate, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
+
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
-    global comment_id_seq
-    comment_id_seq += 1
-
-    new_comment = {
-        "id": comment_id_seq,
-        "post_id": post_id,
-        "content": comment.content,
-        "author": comment.author,
-        "created_at": datetime.now()
-    }
-
-    comments[comment_id_seq] = new_comment
-
-    return new_comment
+    
+    comment = Comment(
+        post_id = post_id,
+        content = payload.content,
+        author = payload.author
+    )
+    
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return comment
 
 # 해당 게시글의 모든 댓글 조회
 @app.get("/posts/{post_id}/comments", response_model=list[CommentRead])
-def get_all_comments(post_id: int):
-    if post_id not in posts:
+def get_all_comments(post_id: int, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
+
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    return [c for c in comments.values() if c["post_id"] == post_id]
+    return db.scalars(select(Comment).where(Comment.post_id == post_id)).all()
 
 # 해당 게시글의 특정 댓글 조회
 @app.get("/posts/{post_id}/comments/{comment_id}", response_model=CommentRead)
-def get_comment(post_id: int, comment_id: int):
-    comment = comments.get(comment_id)
-    if (not comment) or (comment["post_id"] != post_id):
+def get_comment(post_id: int, comment_id: int, db: Session = Depends(get_session)):
+    comment = db.scalar(select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id))
+
+    if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
     
     return comment
 
 # 댓글 업데이트
 @app.put("/posts/{post_id}/comments/{comment_id}", response_model=CommentRead)
-def update_comment(post_id: int, comment_id: int, updated_comment: CommentUpdate):
-    comment = comments.get(comment_id)
-    if (not comment) or (comment["post_id"] != post_id):
-        raise HTTPException(status_code=404, detail="Comment not found")
-    if updated_comment.content is not None:
-        comment["content"] = updated_comment.content
+def update_comment(post_id: int, comment_id: int, updated_comment: CommentUpdate, db: Session = Depends(get_session)):
+    comment = db.scalar(select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id))
     
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    
+    if updated_comment.content is not None:
+        comment.content = updated_comment.content
+    
+    db.commit()
+    db.refresh(comment)
     return comment
 
 # 댓글 삭제
 @app.delete("/posts/{post_id}/comments/{comment_id}", status_code=204)
-def delete_comment(post_id:int, comment_id:int):
-    comment = comments.get(comment_id)
-    if (not comment) or (comment["post_id"] != post_id):
+def delete_comment(post_id:int, comment_id:int, db: Session = Depends(get_session)):
+    comment = db.scalar(select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id))
+    
+    if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
     
-    del comments[comment_id]
+    db.delete(comment)
+    db.commit()
 
 # ----- LLM 호출 -----
 async def request_summarize(content: str):
@@ -210,12 +279,13 @@ async def request_summarize(content: str):
 # ----- LLM 엔드포인트 -----
 # 게시글 요약
 @app.get("/posts/{post_id}/summary", response_model=SummaryResponse)
-async def summarize_post(post_id: int):
-    post = posts.get(post_id)
+async def summarize_post(post_id: int, db: Session = Depends(get_session)):
+    post = db.scalar(select(Post).where(Post.id == post_id))
+
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     
-    text = f"제목: {post['title']}\n본문: {post['content']}"
+    text = f"제목: {post.title}\n본문: {post.content}"
     summary = await request_summarize(text)
 
     return {
@@ -226,12 +296,13 @@ async def summarize_post(post_id: int):
 
 # 댓글 요약
 @app.get("/posts/{post_id}/comments/{comment_id}/summary", response_model=SummaryResponse)
-async def summarize_comment(post_id: int, comment_id: int):
-    comment = comments.get(comment_id)
-    if (not comment) or (comment["post_id"] != post_id):
+async def summarize_comment(post_id: int, comment_id: int, db: Session = Depends(get_session)):
+    comment = db.scalar(select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id))
+    
+    if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
     
-    summary = await request_summarize(comment["content"])
+    summary = await request_summarize(comment.content)
 
     return {
         "target_type": "comment",
