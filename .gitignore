@@ -1,6 +1,11 @@
 .env
 __pycache__/
 *.pyc
-.venv/
+venv/
+.venv*/
 *.swp
-*.db 
+*.swo
+.DS_Store
+*.db
+cache/ 
+korean_chatbot/
